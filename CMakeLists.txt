@@ -14,4 +14,6 @@ set(TESTED_SOURCE
     ../examples/autotest-validate/autotest-validate.c
     ../examples/systemcalls/systemcalls.c
 )
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
 add_subdirectory(assignment-autotest)
