@@ -2,6 +2,7 @@
 #include <asm-generic/errno-base.h>
 #include <atomic>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syslog.h>
 #include <sys/types.h>
 #include <syslog.h>
@@ -37,14 +39,54 @@ void sig_setup() {
   }
 }
 
+void daemonize() {
+  pid_t pid;
+
+  // Fork the parent process
+  pid = fork();
+  if (pid < 0) {
+    perror("fork failed");
+    exit(EXIT_FAILURE);
+  }
+
+  // Exit the parent process
+  if (pid > 0) {
+    exit(EXIT_SUCCESS);
+  }
+
+  // Change working directory to root
+  if (chdir("/") < 0) {
+    perror("chdir failed");
+    exit(EXIT_FAILURE);
+  }
+
+  // Redirect stdin, stdout, stderr to /dev/null
+  int fd = open("/dev/null", O_WRONLY | O_TRUNC | O_CREAT, 0644);
+  if (fd < 0) {
+    perror("Cannot open /dev/null");
+    exit(EXIT_FAILURE);
+  } else {
+    dup2(fd, STDIN_FILENO);
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    close(fd);
+  }
+}
+
 int main(int argc, char *argv[]) {
+  bool daemon_mode = false;
+
+  // Parse command line arguments
+  if (argc > 1 && strcmp(argv[1], "-d") == 0) {
+    daemon_mode = true;
+  }
+
   openlog("server", 0, LOG_USER);
   sig_setup();
 
   int server_fd;
   struct sockaddr_in address;
   int opt = 1;
-  FILE *fout = fopen(FILE_OUT, "w+");
 
   // Creating socket file descriptor
   if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -65,12 +107,30 @@ int main(int argc, char *argv[]) {
     perror("bind failed");
     return EXIT_FAILURE;
   }
+
+  // Daemonize after successful bind
+  if (daemon_mode) {
+    daemonize();
+    // Reopen syslog after daemonizing since file descriptors were closed
+    openlog("server", 0, LOG_USER);
+  }
+
+  FILE *fout = fopen(FILE_OUT, "w+");
+  if (!fout) {
+    perror("Cannot open file");
+    close(server_fd);
+    return EXIT_FAILURE;
+  }
+
   if (listen(server_fd, 0) < 0 && errno != EINTR) {
     perror("listen");
+    fclose(fout);
+    close(server_fd);
     return EXIT_FAILURE;
   } else if (errno == EINTR) {
     goto STOP;
   }
+
   do {
     int ret = serve_client(server_fd, &address, fout);
     if (ret < 0) {
@@ -81,11 +141,12 @@ int main(int argc, char *argv[]) {
 STOP:
   close(server_fd);
   fclose(fout);
+  remove(FILE_OUT);
   return 0;
 }
 
 int serve_client(int server_fd, struct sockaddr_in *address, FILE *fout) {
-  ssize_t pkt_len;
+  ssize_t pkt_len = 0;
   std::string buffer;
   size_t buffer_idx = 0;
   char pkt[2048] = {0};
@@ -105,8 +166,7 @@ int serve_client(int server_fd, struct sockaddr_in *address, FILE *fout) {
     goto STOP;
   }
   inet_ntop(AF_INET, &(address->sin_addr), pkt, INET_ADDRSTRLEN);
-  syslog(LOG_DEBUG, "Accepted connection from %s", pkt);
-  syslog(LOG_DEBUG, "File sz: %zu", file_sz);
+  syslog(LOG_USER, "Accepted connection from %s", pkt);
 
   while (running) {
     pkt_len = recv(new_socket, pkt, sizeof(pkt) / sizeof(pkt[0]) - 1, 0);
@@ -116,7 +176,7 @@ int serve_client(int server_fd, struct sockaddr_in *address, FILE *fout) {
       perror("Error while recv");
       goto STOP;
     } else {
-      buffer += std::string_view(pkt, pkt_len);
+      buffer.insert(buffer.end(), pkt, pkt + pkt_len);
       for (size_t i = buffer_idx; i < buffer.length(); ++i) {
         if (buffer[i] == '\n') {
           fwrite(&buffer[buffer_idx], 1, i - buffer_idx + 1, fout);
@@ -150,10 +210,10 @@ int serve_client(int server_fd, struct sockaddr_in *address, FILE *fout) {
 
 STOP:
   if (running == 0) {
-    syslog(LOG_DEBUG, "Caught signal, exiting");
+    syslog(LOG_USER, "Caught signal, exiting");
   } else if (pkt_len == 0) {
-    syslog(LOG_DEBUG, "File sz: %zu", file_sz);
-    syslog(LOG_DEBUG, "End file reception");
+    inet_ntop(AF_INET, &(address->sin_addr), pkt, INET_ADDRSTRLEN);
+    syslog(LOG_USER, "Closed connection from %s", pkt);
   }
   close(new_socket);
   return pkt_len;
